@@ -387,6 +387,151 @@ struct AicpuExecutor {
         }
     }
 
+    template <CoreType CT>
+    int32_t check_running_cores_for_completion_batch(int32_t thread_idx,
+        CoreTypeTracker& ct,
+        bool* core_idle,
+        Handshake* hank,
+        int32_t* executing_task_ids,
+        int32_t& completed_this_turn,
+        int32_t& cur_thread_completed,
+        bool& made_progress,
+        PTO2DeferredReleaseManager& deferred_mgr,
+        PTO2LocalReadyBuffer* local_bufs
+#if PTO2_PROFILING
+        ,
+        bool profiling_enabled,
+        uint64_t& complete_probe_count,
+        uint64_t& complete_hit_count,
+        uint32_t& phase_complete_count,
+        uint64_t& notify_edges_total,
+        int32_t& notify_max_degree,
+        uint64_t& notify_tasks_enqueued,
+        uint64_t& fanin_edges_total,
+        int32_t& fanin_max_degree
+#endif
+#if PTO2_SCHED_PROFILING
+        ,
+        uint64_t& sched_complete_perf_cycle
+#endif
+    ) {
+        constexpr int BATCH_COMPLETE_SIZE = 8;
+        int32_t completed_core_ids[BATCH_COMPLETE_SIZE];
+        int32_t completed_task_ids[BATCH_COMPLETE_SIZE];
+        int32_t batch_count = 0;
+        
+#if PTO2_PROFILING
+        (void)fanin_edges_total;
+        (void)fanin_max_degree;
+#endif
+        
+        for (int32_t i = ct.running_count - 1; i >= 0 && batch_count < BATCH_COMPLETE_SIZE; i--) {
+            int32_t core_id = ct.running[i];
+            uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+            
+            int32_t task_id = executing_task_ids[core_id];
+            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
+            int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
+            
+#if PTO2_PROFILING
+            if (profiling_enabled) {
+                complete_probe_count++;
+            }
+#endif
+            
+            if (reg_task_id == task_id && reg_state == TASK_FIN_STATE) {
+                completed_core_ids[batch_count] = core_id;
+                completed_task_ids[batch_count] = task_id;
+                batch_count++;
+#if PTO2_PROFILING
+                if (profiling_enabled) {
+                    complete_hit_count++;
+                }
+#endif
+            }
+        }
+        
+        if (batch_count == 0) return 0;
+        
+        for (int32_t b = 0; b < batch_count; b++) {
+            int32_t core_id = completed_core_ids[b];
+            int32_t task_id = completed_task_ids[b];
+            
+            executing_task_ids[core_id] = AICPU_TASK_INVALID;
+            PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+            int32_t mixed_task_id = payload->mixed_task_id;
+            PTO2SubtaskSlot subslot = payload->subslot;
+            
+            bool mixed_complete = rt->scheduler.on_subtask_complete(mixed_task_id, subslot);
+            if (mixed_complete) {
+#if PTO2_PROFILING
+                PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(mixed_task_id, local_bufs);
+                notify_edges_total += cstats.fanout_edges;
+                if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
+                notify_tasks_enqueued += cstats.tasks_enqueued;
+                phase_complete_count++;
+#else
+                rt->scheduler.on_mixed_task_complete(mixed_task_id, local_bufs);
+#endif
+                deferred_mgr.add_deferred(mixed_task_id);
+#if PTO2_PROFILING
+                fanin_edges_total += cstats.fanin_edges;
+                if (cstats.fanin_edges > fanin_max_degree) fanin_max_degree = cstats.fanin_edges;
+#endif
+            }
+            
+            int32_t idx = -1;
+            for (int32_t j = 0; j < ct.running_count; j++) {
+                if (ct.running[j] == core_id) {
+                    idx = j;
+                    break;
+                }
+            }
+            if (idx >= 0) {
+                ct.move_running_to_idle(idx);
+            }
+            core_idle[core_id] = true;
+            
+#if PTO2_PROFILING
+            if (profiling_enabled) {
+#if PTO2_SCHED_PROFILING
+                uint64_t t_perf_start = get_sys_cnt_aicpu();
+#endif
+                Handshake* h = &hank[core_id];
+                uint64_t finish_ts = get_sys_cnt_aicpu();
+                PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
+                rmb();
+                uint32_t count = perf_buf->count;
+                if (count > 0) {
+                    PerfRecord* record = &perf_buf->records[count - 1];
+                    if (record->task_id == static_cast<uint32_t>(payload->mixed_task_id)) {
+                        perf_aicpu_record_dispatch_and_finish_time(
+                            record, dispatch_timestamps_[core_id], finish_ts);
+                    }
+                }
+#if PTO2_SCHED_PROFILING
+                sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
+#endif
+            }
+#endif
+            
+            DEV_DEBUG("Thread %d: %s core %d completed PTO2 task %d (mixed_complete=%d)",
+                thread_idx,
+                CT == CoreType::AIC ? "AIC" : "AIV",
+                core_id,
+                task_id,
+                mixed_complete ? 1 : 0);
+            cur_thread_completed++;
+            if (mixed_complete) {
+                completed_this_turn++;
+            }
+        }
+        
+        made_progress = true;
+        return batch_count;
+    }
+
     static const char* shape_name(PTO2ResourceShape shape) {
         switch (shape) {
         case PTO2ResourceShape::AIC_ONLY:   return "AIC_ONLY";
@@ -948,8 +1093,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ids, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ids, LOCAL_READY_CAP_PER_TYPE);
-    int32_t deferred_release_ids[128];
-    int32_t deferred_release_count = 0;
+    
+    PTO2DeferredReleaseManager deferred_mgr;
 
     bool cores_released = false;
 
@@ -998,7 +1143,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         // Sched time = finish_ts - dispatch_ts; recording finish_ts here at loop start reduces
         // tail overhead (time from AICore done to AICPU recording finish).
 
-        // Phase 1: Check running cores for completion, process and move to idle
+        // Phase 1: Check running cores for completion, process and move to idle (batch mode)
         int32_t completed_this_turn = 0;
 
         // Check AIC running cores
@@ -1006,10 +1151,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);  // Invariant: previous iteration fully consumed
         if (tracker.aic().running_count > 0) {
             try_completed = true;
-            check_running_cores_for_completion<CoreType::AIC>(
+            check_running_cores_for_completion_batch<CoreType::AIC>(
                 thread_idx, tracker.aic(), tracker.core_idle, hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count,
+                deferred_mgr,
                 local_bufs
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -1025,10 +1170,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         // Check AIV running cores
         if (tracker.aiv().running_count > 0) {
             try_completed = true;
-            check_running_cores_for_completion<CoreType::AIV>(
+            check_running_cores_for_completion_batch<CoreType::AIV>(
                 thread_idx, tracker.aiv(), tracker.core_idle, hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count,
+                deferred_mgr,
                 local_bufs
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -1233,21 +1378,26 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         if (made_progress) {
             idle_iterations = 0;
+            deferred_mgr.on_progress();
         } else {
-            // Batch deferred fanin releases during idle.
-            // Processing all pending releases at once advances the ring faster,
-            // freeing heap space for the orchestrator without blocking completion polling.
-            while (deferred_release_count > 0) {
+            deferred_mgr.on_no_progress();
+            
+            if (deferred_mgr.deferred_release_count > 0 && 
+                deferred_mgr.should_release_now(false)) {
+                while (deferred_mgr.deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe = rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count], thread_idx);
+                    int32_t fe = rt->scheduler.on_task_release(
+                        deferred_mgr.deferred_release_ids[--deferred_mgr.deferred_release_count], thread_idx);
 #else
-                int32_t fe = rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count]);
+                    int32_t fe = rt->scheduler.on_task_release(
+                        deferred_mgr.deferred_release_ids[--deferred_mgr.deferred_release_count]);
 #endif
-                (void)fe;
+                    (void)fe;
 #if PTO2_PROFILING
-                fanin_edges_total += fe;
-                if (fe > fanin_max_degree) fanin_max_degree = fe;
+                    fanin_edges_total += fe;
+                    if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
+                }
             }
             idle_iterations++;
             if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {

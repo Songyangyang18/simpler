@@ -203,6 +203,36 @@ struct alignas(64) PTO2ReadyQueue {
         return task_id;
     }
 
+    int32_t pop_batch(int32_t* task_ids, int32_t max_count) {
+        if (max_count <= 0) return 0;
+        
+        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
+        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
+        
+        int32_t count = 0;
+        while (count < max_count && d < e) {
+            uint64_t pos = d;
+            PTO2ReadyQueueSlot* slot = &slots[pos & mask];
+            int64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = seq - (int64_t)(pos + 1);
+            
+            if (diff == 0) {
+                if (dequeue_pos.compare_exchange_weak(d, d + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    task_ids[count++] = slot->task_id;
+                    slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
+                    d = d + 1;
+                    e = enqueue_pos.load(std::memory_order_relaxed);
+                }
+            } else if (diff < 0) {
+                break;
+            } else {
+                d = dequeue_pos.load(std::memory_order_relaxed);
+            }
+        }
+        return count;
+    }
+
 #if PTO2_SCHED_PROFILING
     int32_t pop(uint64_t& atomic_count, uint64_t& wait_cycle) {
         // Fast-path: skip slot load when queue is clearly empty
@@ -268,6 +298,53 @@ struct PTO2CompletionStats {
     int32_t tasks_enqueued;    // Number of consumers that became READY
     int32_t fanin_edges;       // Number of fanin edges traversed (release producers)
     bool mixed_task_completed; // True only when this callback completed a mixed task
+};
+
+struct PTO2DeferredReleaseManager {
+    static constexpr int DEFERRED_THRESHOLD_HIGH = 96;
+    static constexpr int DEFERRED_THRESHOLD_LOW = 32;
+    static constexpr int DEFERRED_MAX = 128;
+    static constexpr int NO_PROGRESS_THRESHOLD = 100;
+    
+    int32_t deferred_release_ids[DEFERRED_MAX];
+    int32_t deferred_release_count;
+    int32_t consecutive_no_progress;
+    
+    PTO2DeferredReleaseManager() : deferred_release_count(0), consecutive_no_progress(0) {}
+    
+    void reset() {
+        deferred_release_count = 0;
+        consecutive_no_progress = 0;
+    }
+    
+    bool add_deferred(int32_t task_id) {
+        if (deferred_release_count < DEFERRED_MAX) {
+            deferred_release_ids[deferred_release_count++] = task_id;
+            return true;
+        }
+        return false;
+    }
+    
+    bool should_release_now(bool heap_pressure_high) const {
+        if (deferred_release_count >= DEFERRED_THRESHOLD_HIGH) {
+            return true;
+        }
+        if (consecutive_no_progress > NO_PROGRESS_THRESHOLD && deferred_release_count > 0) {
+            return true;
+        }
+        if (heap_pressure_high && deferred_release_count > DEFERRED_THRESHOLD_LOW) {
+            return true;
+        }
+        return false;
+    }
+    
+    void on_progress() {
+        consecutive_no_progress = 0;
+    }
+    
+    void on_no_progress() {
+        consecutive_no_progress++;
+    }
 };
 
 /**
@@ -513,6 +590,39 @@ struct PTO2SchedulerState {
         return ready_queues[static_cast<int32_t>(shape)].pop();
     }
 
+    int32_t get_ready_tasks_batch(PTO2ResourceShape shape, int32_t* task_ids, int32_t max_count,
+                                   PTO2LocalReadyBuffer* local_bufs = nullptr) {
+        int32_t count = 0;
+        
+        int32_t buf_idx = get_buf_idx_for_shape(shape);
+        if (local_bufs && buf_idx >= 0) {
+            while (count < max_count && local_bufs[buf_idx].count > 0) {
+                task_ids[count++] = local_bufs[buf_idx].pop();
+            }
+        }
+        
+        if (count < max_count) {
+            count += ready_queues[static_cast<int32_t>(shape)].pop_batch(
+                task_ids + count, max_count - count);
+        }
+        
+        return count;
+    }
+
+    int32_t get_buf_idx_for_shape(PTO2ResourceShape shape) {
+        switch (shape) {
+            case PTO2ResourceShape::AIC_ONLY:
+            case PTO2ResourceShape::AIC_AIV_X1:
+            case PTO2ResourceShape::AIC_AIV_X2:
+                return 0;  // AIC-containing tasks go to buf[0]
+            case PTO2ResourceShape::AIV_X1:
+            case PTO2ResourceShape::AIV_X2:
+                return 1;  // AIV-only tasks go to buf[1]
+            default:
+                return -1;
+        }
+    }
+
     template<CoreType CT>
     int32_t get_ready_task(PTO2LocalReadyBuffer* local_bufs) {
         constexpr int ct = static_cast<int>(CT);
@@ -520,6 +630,25 @@ struct PTO2SchedulerState {
             return local_bufs[ct].pop();
         }
         return ready_queues[ct].pop();
+    }
+
+    template<CoreType CT>
+    int32_t get_ready_tasks_batch(int32_t* task_ids, int32_t max_count,
+                                   PTO2LocalReadyBuffer* local_bufs) {
+        constexpr int ct = static_cast<int>(CT);
+        int32_t count = 0;
+        
+        if (local_bufs && local_bufs[ct].count > 0) {
+            while (count < max_count && local_bufs[ct].count > 0) {
+                task_ids[count++] = local_bufs[ct].pop();
+            }
+        }
+        
+        if (count < max_count) {
+            count += ready_queues[ct].pop_batch(task_ids + count, max_count - count);
+        }
+        
+        return count;
     }
 
 #if PTO2_SCHED_PROFILING
