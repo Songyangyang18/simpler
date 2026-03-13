@@ -40,6 +40,9 @@
 // Core type definitions
 #include "common/core_type.h"
 
+// Forward declaration for PTO2ResourceShape (used in direct dispatch callback)
+enum class PTO2ResourceShape : uint8_t;
+
 #if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
@@ -109,6 +112,27 @@ struct CoreStateTracker {
     template<CoreType CT>
     CoreTypeTracker& get() { return by_type[static_cast<int32_t>(CT)]; }
 };
+
+// Forward declaration for direct dispatch context
+struct AicpuExecutor;
+
+// Direct dispatch context for pypto-style optimization
+// Thread-local context allows release_fanin_and_check_ready to dispatch directly
+struct DirectDispatchContext {
+    AicpuExecutor* executor;
+    Runtime* runtime;
+    CoreStateTracker* tracker;
+    int32_t* executing_task_ids;
+    PTO2TaskDescriptor* task_descriptors;
+    PTO2TaskPayload* task_payloads;
+    int32_t thread_idx;
+    int32_t core_num;
+#if PTO2_PROFILING
+    bool profiling_enabled;
+#endif
+};
+
+static thread_local DirectDispatchContext tl_dispatch_ctx;
 
 struct AicpuExecutor {
     int32_t orch_thread_num_;
@@ -413,6 +437,35 @@ struct AicpuExecutor {
         }
     }
 };
+
+
+static bool direct_dispatch_callback(int32_t task_id, PTO2ResourceShape shape, void* ctx) {
+    DirectDispatchContext* dctx = static_cast<DirectDispatchContext*>(ctx);
+    if (!dctx || !dctx->executor || !dctx->tracker || !dctx->task_descriptors) return false;
+    
+    PTO2TaskDescriptor* task = &dctx->task_descriptors[task_id & (PTO2_TASK_WINDOW_SIZE - 1)];
+    PTO2TaskPayload* task_pl = &dctx->task_payloads[task_id & (PTO2_TASK_WINDOW_SIZE - 1)];
+    
+    CoreType core_type = static_cast<CoreType>(task->worker_type);
+    CoreTypeTracker& ct = dctx->tracker->by_type[static_cast<int32_t>(core_type)];
+    
+    if (ct.idle_count == 0) return false;
+    
+    int32_t core_id = ct.idle[ct.idle_count - 1];
+    
+    PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+    if (core_type == CoreType::AIC) {
+        dctx->executor->build_pto2_payload<CoreType::AIC>(payload, dctx->runtime, task, task_pl);
+    } else {
+        dctx->executor->build_pto2_payload<CoreType::AIV>(payload, dctx->runtime, task, task_pl);
+    }
+    
+    write_reg(dctx->executor->core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id + 1));
+    ct.move_idle_to_running(ct.idle_count - 1);
+    dctx->executing_task_ids[core_id] = task_id;
+    
+    return true;
+}
 
 static AicpuExecutor g_aicpu_executor;
 
@@ -823,6 +876,24 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     }
 
     DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_num);
+#if PTO2_PROFILING
+    bool profiling_enabled = runtime->enable_profiling;
+#endif
+
+    // Setup direct dispatch callback for pypto-style optimization
+    tl_dispatch_ctx.executor = this;
+    tl_dispatch_ctx.runtime = runtime;
+    tl_dispatch_ctx.tracker = &tracker;
+    tl_dispatch_ctx.executing_task_ids = executing_task_ids;
+    tl_dispatch_ctx.task_descriptors = task_descriptors;
+    tl_dispatch_ctx.task_payloads = task_payloads;
+    tl_dispatch_ctx.thread_idx = thread_idx;
+    tl_dispatch_ctx.core_num = core_num;
+#if PTO2_PROFILING
+    tl_dispatch_ctx.profiling_enabled = profiling_enabled;
+#endif
+    rt->scheduler.direct_dispatch_cb = direct_dispatch_callback;
+    rt->scheduler.direct_dispatch_ctx = &tl_dispatch_ctx;
     int32_t cur_thread_completed = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
@@ -831,9 +902,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #endif
 
     // Scheduler profiling counters
-#if PTO2_PROFILING
-    uint64_t sched_scan_cycle = 0;
-    uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
     uint64_t sched_idle_cycle = 0;
     uint64_t complete_probe_count = 0;

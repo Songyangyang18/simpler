@@ -150,6 +150,27 @@ struct CoreStateTracker {
     }
 };
 
+// Forward declaration for direct dispatch context
+struct AicpuExecutor;
+
+// Direct dispatch context for pypto-style optimization
+// Thread-local context allows release_fanin_and_check_ready to dispatch directly
+struct DirectDispatchContext {
+    AicpuExecutor* executor;
+    Runtime* runtime;
+    CoreStateTracker* tracker;
+    int32_t* executing_task_ids;
+    PTO2TaskDescriptor* task_descriptors;
+    PTO2TaskPayload* task_payloads;
+    int32_t thread_idx;
+    int32_t core_num;
+#if PTO2_PROFILING
+    bool profiling_enabled;
+#endif
+};
+
+static thread_local DirectDispatchContext tl_dispatch_ctx;
+
 struct AicpuExecutor {
     int32_t orch_thread_num_;
     int32_t sched_thread_num_;
@@ -503,6 +524,86 @@ struct AicpuExecutor {
         executing_task_ids[core_id] = task_id;
     }
 };
+
+
+static bool direct_dispatch_callback(int32_t task_id, PTO2ResourceShape shape, void* ctx) {
+    DirectDispatchContext* dctx = static_cast<DirectDispatchContext*>(ctx);
+    if (!dctx || !dctx->executor || !dctx->tracker || !dctx->task_descriptors) return false;
+    
+    int32_t ci = dctx->tracker->find_cluster_for_shape(shape);
+    if (ci < 0) return false;
+    
+    Cluster& c = dctx->tracker->clusters[ci];
+    PTO2TaskDescriptor* task = &dctx->task_descriptors[task_id & (PTO2_TASK_WINDOW_SIZE - 1)];
+    PTO2TaskPayload* task_pl = &dctx->task_payloads[task_id & (PTO2_TASK_WINDOW_SIZE - 1)];
+    
+    bool aic_idle = dctx->tracker->core_idle[c.aic_core_id];
+    bool aiv0_idle = dctx->tracker->core_idle[c.aiv_core_ids[0]];
+    bool aiv1_idle = dctx->tracker->core_idle[c.aiv_core_ids[1]];
+    
+    bool need_aic = false;
+    bool need_aiv0 = false;
+    bool need_aiv1 = false;
+    
+    switch (shape) {
+    case PTO2ResourceShape::AIC_ONLY:
+        if (!aic_idle) return false;
+        need_aic = true;
+        break;
+    case PTO2ResourceShape::AIV_X1:
+        if ((task->active_mask & PTO2_SUBTASK_MASK_AIV0) && !aiv0_idle) return false;
+        if ((task->active_mask & PTO2_SUBTASK_MASK_AIV1) && !aiv1_idle) return false;
+        need_aiv0 = (task->active_mask & PTO2_SUBTASK_MASK_AIV0);
+        need_aiv1 = (task->active_mask & PTO2_SUBTASK_MASK_AIV1);
+        break;
+    case PTO2ResourceShape::AIV_X2:
+        if (!aiv0_idle || !aiv1_idle) return false;
+        need_aiv0 = true;
+        need_aiv1 = true;
+        break;
+    case PTO2ResourceShape::AIC_AIV_X1:
+        if (!aic_idle) return false;
+        if ((task->active_mask & PTO2_SUBTASK_MASK_AIV0) && !aiv0_idle) return false;
+        if ((task->active_mask & PTO2_SUBTASK_MASK_AIV1) && !aiv1_idle) return false;
+        need_aic = true;
+        need_aiv0 = (task->active_mask & PTO2_SUBTASK_MASK_AIV0);
+        need_aiv1 = (task->active_mask & PTO2_SUBTASK_MASK_AIV1);
+        break;
+    case PTO2ResourceShape::AIC_AIV_X2:
+        if (!aic_idle || !aiv0_idle || !aiv1_idle) return false;
+        need_aic = true;
+        need_aiv0 = true;
+        need_aiv1 = true;
+        break;
+    }
+    
+    if (need_aic) {
+        dctx->executor->dispatch_subtask_to_core(dctx->runtime, *dctx->tracker, dctx->executing_task_ids,
+            c.aic_core_id, CoreType::AIC, task_id, task, task_pl, PTO2SubtaskSlot::AIC
+#if PTO2_PROFILING
+            , dctx->profiling_enabled, dctx->thread_idx
+#endif
+        );
+    }
+    if (need_aiv0) {
+        dctx->executor->dispatch_subtask_to_core(dctx->runtime, *dctx->tracker, dctx->executing_task_ids,
+            c.aiv_core_ids[0], CoreType::AIV, task_id, task, task_pl, PTO2SubtaskSlot::AIV0
+#if PTO2_PROFILING
+            , dctx->profiling_enabled, dctx->thread_idx
+#endif
+        );
+    }
+    if (need_aiv1) {
+        dctx->executor->dispatch_subtask_to_core(dctx->runtime, *dctx->tracker, dctx->executing_task_ids,
+            c.aiv_core_ids[1], CoreType::AIV, task_id, task, task_pl, PTO2SubtaskSlot::AIV1
+#if PTO2_PROFILING
+            , dctx->profiling_enabled, dctx->thread_idx
+#endif
+        );
+    }
+    
+    return true;
+}
 
 static AicpuExecutor g_aicpu_executor;
 
@@ -915,12 +1016,27 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     }
 
     DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_num);
-    int32_t cur_thread_completed = 0;
-    int32_t idle_iterations = 0;
-    int32_t last_progress_count = 0;
 #if PTO2_PROFILING
     bool profiling_enabled = runtime->enable_profiling;
 #endif
+
+    // Setup direct dispatch callback for pypto-style optimization
+    tl_dispatch_ctx.executor = this;
+    tl_dispatch_ctx.runtime = runtime;
+    tl_dispatch_ctx.tracker = &tracker;
+    tl_dispatch_ctx.executing_task_ids = executing_task_ids;
+    tl_dispatch_ctx.task_descriptors = task_descriptors;
+    tl_dispatch_ctx.task_payloads = task_payloads;
+    tl_dispatch_ctx.thread_idx = thread_idx;
+    tl_dispatch_ctx.core_num = core_num;
+#if PTO2_PROFILING
+    tl_dispatch_ctx.profiling_enabled = profiling_enabled;
+#endif
+    rt->scheduler.direct_dispatch_cb = direct_dispatch_callback;
+    rt->scheduler.direct_dispatch_ctx = &tl_dispatch_ctx;
+    int32_t cur_thread_completed = 0;
+    int32_t idle_iterations = 0;
+    int32_t last_progress_count = 0;
 
     // Scheduler profiling counters
 #if PTO2_PROFILING
@@ -957,6 +1073,16 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ids, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ids, LOCAL_READY_CAP_PER_TYPE);
+
+    // Prefetch buffers for Phase 3 global queue optimization
+    // These buffers reduce atomic operations by batching pop() calls
+    // Increased from 32 to 64 to reduce global queue access frequency
+    constexpr int PREFETCH_CAP_PER_SHAPE = 64;
+    static_assert(PTO2_NUM_RESOURCE_SHAPES == 5, "PREFETCH_CAP_PER_SHAPE assumes 5 shapes");
+    int32_t prefetch_ids[PTO2_NUM_RESOURCE_SHAPES][PREFETCH_CAP_PER_SHAPE];
+    int32_t prefetch_count[PTO2_NUM_RESOURCE_SHAPES] = {0, 0, 0, 0, 0};
+    int32_t prefetch_idx[PTO2_NUM_RESOURCE_SHAPES] = {0, 0, 0, 0, 0};
+
     int32_t deferred_release_ids[256];
     int32_t deferred_release_count = 0;
 
@@ -1159,24 +1285,50 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         }
 
         // Phase 3: Global dispatch — fill remaining idle cores from global readyQ (cluster-based)
+        // Optimization: Use prefetch buffers to reduce atomic operations
+        // Key: Check task availability BEFORE entering the loop to avoid unnecessary find_cluster_for_shape() calls
         const PTO2ResourceShape* dispatch_order = get_dispatch_order(thread_idx);
 
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
-            if (rt->scheduler.ready_queues[static_cast<int32_t>(shape)].size() == 0) continue;
+            int32_t shape_idx = static_cast<int32_t>(shape);
+
+            // Pre-check: skip this shape if no tasks available (prefetch buffer empty AND global queue empty)
+            bool has_prefetched = (prefetch_idx[shape_idx] < prefetch_count[shape_idx]);
+            bool has_global = (rt->scheduler.ready_queues[shape_idx].size() > 0);
+            if (!has_prefetched && !has_global) continue;
 
             while (true) {
                 int32_t ci = tracker.find_cluster_for_shape(shape);
                 if (ci < 0) break;
 
-                int32_t task_id = pop_ready_task(shape, thread_idx
+                // Try to get task from prefetch buffer first (zero atomic ops)
+                int32_t task_id = -1;
+                if (prefetch_idx[shape_idx] < prefetch_count[shape_idx]) {
+                    task_id = prefetch_ids[shape_idx][prefetch_idx[shape_idx]++];
+                } else {
+                    // Prefetch buffer empty, batch fetch from global queue
+                    prefetch_count[shape_idx] = 0;
+                    prefetch_idx[shape_idx] = 0;
+                    int32_t fetch_count = 0;
+                    while (fetch_count < PREFETCH_CAP_PER_SHAPE) {
+                        int32_t id = pop_ready_task(shape, thread_idx
 #if PTO2_PROFILING
-                    , pop_hit, pop_miss
+                            , pop_hit, pop_miss
 #endif
 #if PTO2_SCHED_PROFILING
-                    , sched_dispatch_pop_cycle
+                            , sched_dispatch_pop_cycle
 #endif
-                );
+                        );
+                        if (id < 0) break;
+                        prefetch_ids[shape_idx][fetch_count++] = id;
+                    }
+                    if (fetch_count > 0) {
+                        prefetch_count[shape_idx] = fetch_count;
+                        task_id = prefetch_ids[shape_idx][prefetch_idx[shape_idx]++];
+                    }
+                }
+
                 if (task_id < 0) break;
 
                 try_pushed = true;

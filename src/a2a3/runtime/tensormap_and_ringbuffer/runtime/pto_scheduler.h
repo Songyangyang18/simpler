@@ -311,6 +311,13 @@ struct PTO2SchedulerState {
 #endif
     std::atomic<int32_t> ring_advance_lock{0};  // Try-lock for advance_ring_pointers
 
+    // Direct dispatch callback for pypto-style optimization
+    // When set, release_fanin_and_check_ready will try direct dispatch before queuing
+    // Returns true if task was directly dispatched, false otherwise
+    typedef bool (*DirectDispatchCallback)(int32_t task_id, PTO2ResourceShape shape, void* ctx);
+    DirectDispatchCallback direct_dispatch_cb{nullptr};
+    void* direct_dispatch_ctx{nullptr};
+
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
@@ -435,9 +442,18 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
+            // pypto-style optimization: try direct dispatch first (zero queue overhead)
+            PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
+            if (direct_dispatch_cb && direct_dispatch_cb(task_id, shape, direct_dispatch_ctx)) {
+                // Direct dispatch succeeded - mark task as RUNNING to skip READY state
+                // This is important for state consistency (stall detection, etc.)
+                slot_state.task_state.store(PTO2_TASK_RUNNING, std::memory_order_release);
+                return true;  // Task directly dispatched, skip queue
+            }
+
+            // Fallback: Local-first
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
             bool pushed_local = false;
             if (local_bufs) {
                 int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
@@ -461,13 +477,19 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+            // pypto-style optimization: try direct dispatch first (zero queue overhead)
+            PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
+            if (direct_dispatch_cb && direct_dispatch_cb(task_id, shape, direct_dispatch_ctx)) {
+                // Direct dispatch succeeded - mark task as RUNNING to skip READY state
+                slot_state.task_state.store(PTO2_TASK_RUNNING, std::memory_order_release);
+                return true;  // Task directly dispatched, skip queue
+            }
+
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (slot_state.task_state.compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
-                bool pushed_local = false;
                 if (local_bufs) {
                     int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
                     pushed_local = local_bufs[buf_idx].try_push(task_id);
