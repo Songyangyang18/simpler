@@ -53,34 +53,59 @@ struct MixedKernels {
 };
 
 /**
- * Resource shape — classifies a MixedKernels into one of 5 queue buckets.
+ * Queue type for new warp-based scheduling.
+ * 4 types: AIC, AIV, 1C1V warp, 1C2V warp
  */
-enum class PTO2ResourceShape : uint8_t {
-    AIC_ONLY    = 0,   // AIC only
-    AIV_X1      = 1,   // One AIV slot
-    AIV_X2      = 2,   // Both AIV slots
-    AIC_AIV_X1  = 3,   // AIC + one AIV
-    AIC_AIV_X2  = 4,   // AIC + both AIV
+enum class PTO2QueueType : uint8_t {
+    AIC         = 0,   // Standard AIC task
+    AIV         = 1,   // Standard AIV task (single AIV)
+    AIV_X2      = 2,   // Dual AIV task (AIV0 + AIV1)
+    WRAP_1C1V   = 3,   // 1C1V Warp task
+    WRAP_1C2V   = 4    // 1C2V Warp task
 };
 
-inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 5;
+inline constexpr int32_t PTO2_NUM_QUEUE_TYPES = 5;
 
 /**
- * Derive resource shape from active_mask.
- * Caller must ensure active_mask is valid (at least one bit set).
+ * Warp type classification
  */
-static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
+enum class PTO2WarpType : uint8_t {
+    NONE   = 0,   // Not a warp task
+    C1V1   = 1,   // 1 AIC + 1 AIV
+    C1V2   = 2    // 1 AIC + 2 AIV
+};
+
+inline constexpr int32_t PTO2_MAX_WRAPS = 64;
+inline constexpr int32_t PTO2_MAX_AICORES = 24;
+inline constexpr int32_t PTO2_MAX_AIVCORES = 48;
+
+/**
+ * Derive queue type from active_mask and warp_id.
+ * warp_id >= 0 indicates a warp task, otherwise standard task.
+ */
+static inline PTO2QueueType pto2_get_queue_type(uint8_t active_mask, int8_t warp_id) {
+    (void)warp_id;
+    bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
+    bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
+    bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
+    
+    if (has_aic && has_aiv1) return PTO2QueueType::WRAP_1C2V;
+    if (has_aic && has_aiv0) return PTO2QueueType::WRAP_1C1V;
+    if (has_aiv0 && has_aiv1) return PTO2QueueType::AIV_X2;
+    if (has_aic) return PTO2QueueType::AIC;
+    return PTO2QueueType::AIV;
+}
+
+/**
+ * Derive warp type from active_mask.
+ */
+static inline PTO2WarpType pto2_get_warp_type(uint8_t active_mask) {
     bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
     int aiv_count = ((active_mask & PTO2_SUBTASK_MASK_AIV0) != 0)
                   + ((active_mask & PTO2_SUBTASK_MASK_AIV1) != 0);
-
-    if (has_aic) {
-        if (aiv_count == 0) return PTO2ResourceShape::AIC_ONLY;
-        if (aiv_count == 1) return PTO2ResourceShape::AIC_AIV_X1;
-        return PTO2ResourceShape::AIC_AIV_X2;
-    }
-    if (aiv_count == 1) return PTO2ResourceShape::AIV_X1;
-    return PTO2ResourceShape::AIV_X2;
+    
+    if (!has_aic || aiv_count == 0) return PTO2WarpType::NONE;
+    return (aiv_count == 1) ? PTO2WarpType::C1V1 : PTO2WarpType::C1V2;
 }
 
 /**

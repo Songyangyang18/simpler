@@ -115,26 +115,19 @@ bool PTO2SchedulerState::RingSchedState::init(
     slot_states = nullptr;
     advance_lock.store(0, std::memory_order_relaxed);
 
-    // Allocate per-task slot state array (dynamically sized based on runtime window_size)
     slot_states = new (std::nothrow) PTO2TaskSlotState[task_window_size];
     if (!slot_states) {
         return false;
     }
 
-    // Zero-initialize all per-task slot state fields.
     for (uint64_t i = 0; i < task_window_size; i++) {
         slot_states[i].fanout_lock.store(0, std::memory_order_relaxed);
         slot_states[i].fanout_count = 0;
         slot_states[i].fanout_head = nullptr;
         slot_states[i].task_state.store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
-        slot_states[i].fanin_refcount.store(0, std::memory_order_relaxed);
+        slot_states[i].pred_count.store(0, std::memory_order_relaxed);
         slot_states[i].fanin_count = 0;
         slot_states[i].fanout_refcount.store(0, std::memory_order_relaxed);
-        slot_states[i].payload = nullptr;
-        slot_states[i].task = nullptr;
-        slot_states[i].active_mask = 0;
-        slot_states[i].subtask_done_mask.store(0, std::memory_order_relaxed);
-        slot_states[i].ring_id = 0;
     }
 
     return true;
@@ -155,7 +148,17 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
 
-    // Initialize per-ring state
+    sched->warp_count.store(0, std::memory_order_relaxed);
+    for (int w = 0; w < PTO2_MAX_WRAPS; w++) {
+        sched->warp_mappings[w].warp_id = -1;
+        sched->warp_mappings[w].aicore_id.store(-1, std::memory_order_relaxed);
+        sched->warp_mappings[w].aiv0_core_id = -1;
+        sched->warp_mappings[w].aiv1_core_id = -1;
+        sched->warp_mappings[w].warp_type = PTO2WarpType::NONE;
+        sched->warp_mappings[w].ready_count.store(0, std::memory_order_relaxed);
+        sched->warp_mappings[w].total_count = 0;
+    }
+
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (!sched->ring_sched_states[r].init(sm_handle, r, gm_heap_base, per_ring_heap_size)) {
             for (int j = 0; j < r; j++) {
@@ -165,10 +168,8 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
         }
     }
 
-    // Initialize ready queues (one per resource shape, global)
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+    for (int i = 0; i < PTO2_NUM_QUEUE_TYPES; i++) {
         if (!pto2_ready_queue_init(&sched->ready_queues[i], PTO2_READY_QUEUE_SIZE)) {
-            // Cleanup on failure
             for (int j = 0; j < i; j++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[j]);
             }
@@ -187,7 +188,7 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
         sched->ring_sched_states[r].destroy();
     }
 
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+    for (int i = 0; i < PTO2_NUM_QUEUE_TYPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
 }
@@ -216,10 +217,10 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     LOG_INFO("=== Ready Queues ===");
 
-    const char* shape_names[] = {"AIC_ONLY", "AIV_X1", "AIV_X2", "AIC_AIV_X1", "AIC_AIV_X2"};
+    const char* queue_type_names[] = {"AIC", "AIV", "AIV_X2", "WRAP_1C1V", "WRAP_1C2V"};
 
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        LOG_INFO("  %s: count=%" PRIu64, shape_names[i],
+    for (int i = 0; i < PTO2_NUM_QUEUE_TYPES; i++) {
+        LOG_INFO("  %s: count=%" PRIu64, queue_type_names[i],
                  sched->ready_queues[i].size());
     }
 

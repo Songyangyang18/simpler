@@ -441,12 +441,33 @@ void pto2_submit_mixed_task(
         // Initial fanout_count = 1 (the owning scope holds one reference)
         slot_state.fanout_count = 1;
         slot_state.fanout_refcount.store(0, std::memory_order_release);
-        slot_state.fanin_refcount.store(0, std::memory_order_release);
+        // Optimization: pred_count uses decrement instead of increment
+        // Will be set after dependency analysis
+        slot_state.pred_count.store(0, std::memory_order_release);
         slot_state.payload = payload;
         slot_state.task = &task;
         slot_state.active_mask = active_mask;
         slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
         slot_state.ring_id = ring_id;
+        
+        PTO2WarpType warp_type = pto2_get_warp_type(active_mask);
+        if (warp_type != PTO2WarpType::NONE) {
+            int32_t new_warp_id = sched->warp_count.fetch_add(1, std::memory_order_relaxed);
+            if (new_warp_id < PTO2_MAX_WRAPS) {
+                slot_state.warp_id = static_cast<int8_t>(new_warp_id);
+                sched->warp_mappings[new_warp_id].warp_id = new_warp_id;
+                sched->warp_mappings[new_warp_id].warp_type = warp_type;
+                sched->warp_mappings[new_warp_id].aicore_id.store(-1, std::memory_order_relaxed);
+                sched->warp_mappings[new_warp_id].aiv0_core_id = -1;
+                sched->warp_mappings[new_warp_id].aiv1_core_id = -1;
+                sched->warp_mappings[new_warp_id].ready_count.store(0, std::memory_order_relaxed);
+                sched->warp_mappings[new_warp_id].total_count = 0;
+            } else {
+                slot_state.warp_id = -1;
+            }
+        } else {
+            slot_state.warp_id = -1;
+        }
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -604,7 +625,7 @@ void pto2_submit_mixed_task(
         }
 
         int32_t early_finished = 0;
-        cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
+        cur_slot_state.fanin_count = fanin_count;
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
             payload->fanin_slot_states[i] = fanin_states[i];
@@ -634,13 +655,14 @@ void pto2_submit_mixed_task(
             }
         }
         // Combined release: merge early_finished batch with the +1 init release
-        // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
-        int32_t initial_refcount = early_finished + 1;  // +1 for the init release
-        int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
-                         + initial_refcount;
-        if (new_rc >= fanin_count + 1) {
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
-            sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
+        // Optimization: Use pred_count (decrement) instead of fanin_refcount (increment)
+        // pred_count starts at (fanin_count - early_finished), decrements to 0 when ready
+        int32_t remaining_preds = fanin_count - early_finished;
+        cur_slot_state.pred_count.store(remaining_preds, std::memory_order_release);
+        if (remaining_preds == 0) {
+            cur_slot_state.task_state.store(PTO2_TASK_READY, std::memory_order_release);
+            PTO2QueueType queue_type = pto2_get_queue_type(active_mask, cur_slot_state.warp_id);
+            sched->ready_queues[static_cast<int32_t>(queue_type)].push(&cur_slot_state);
         }
         // Record dep pool watermark in local slot state (used by tail reclamation)
         cur_slot_state.dep_pool_mark = orch->rings[ring_id].dep_pool.top;
@@ -648,9 +670,7 @@ void pto2_submit_mixed_task(
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
         // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
         g_orch_fanin_atomic_count += fanin_count * 3;
-        if (early_finished > 0) {
-            g_orch_fanin_atomic_count += 1;  // fanin_refcount.fetch_add
-        }
+        g_orch_fanin_atomic_count += 1;  // pred_count.store
 #endif
     }
 

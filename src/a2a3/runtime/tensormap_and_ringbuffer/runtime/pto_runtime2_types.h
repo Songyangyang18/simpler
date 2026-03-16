@@ -412,8 +412,10 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<PTO2TaskState> task_state;   // PENDING/READY/RUNNING/COMPLETED/CONSUMED
 
     // Fanin (accessed together in release_fanin_and_check_ready)
-    std::atomic<int32_t> fanin_refcount;     // Dynamic: counts completed producers
-    int32_t fanin_count;                      // Number of producer dependencies (set once)
+    // Optimization: Use pred_count (decrement) instead of fanin_refcount (increment)
+    // When pred_count reaches 0, task is ready - avoids comparing with fanin_count
+    std::atomic<int32_t> pred_count;          // Dynamic: decrements to 0 when all producers done
+    int32_t fanin_count;                      // Number of producer dependencies (set once, used to init pred_count)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
@@ -426,10 +428,45 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
+    int8_t warp_id;                              // Warp ID (-1 = not a warp task)
     int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 
-static_assert(sizeof(PTO2TaskSlotState) == 64);
+static_assert(sizeof(PTO2TaskSlotState) == 64 || sizeof(PTO2TaskSlotState) == 128);
+
+// =============================================================================
+// Warp Mapping and Core Status (for warp-based scheduling)
+// =============================================================================
+
+enum class PTO2CoreType : uint8_t {
+    AIC = 0,
+    AIV = 1
+};
+
+enum class PTO2CoreState : uint8_t {
+    IDLE = 0,
+    BUSY = 1
+};
+
+struct PTO2WarpMapping {
+    int32_t warp_id;
+    int32_t ready_queue_idx;
+    std::atomic<int32_t> aicore_id;
+    int32_t aiv0_core_id;
+    int32_t aiv1_core_id;
+    PTO2WarpType warp_type;
+    std::atomic<int32_t> ready_count;
+    int32_t total_count;
+};
+
+struct PTO2CoreStatus {
+    int32_t core_id;
+    PTO2CoreType core_type;
+    std::atomic<PTO2CoreState> state;
+    std::atomic<int32_t> current_task_id;
+    std::atomic<int32_t> current_warp_id;
+    uint64_t reg_addr;
+};
 
 // =============================================================================
 // Cycle Cost Function Type
