@@ -134,6 +134,29 @@ struct alignas(64) PTO2ReadyQueue {
         return true;
     }
 
+    /**
+     * Batch push: push multiple tasks in a single call.
+     * Pypto-style optimization: amortize atomic operation overhead.
+     * Memory access: 1 RMW (fetch_add) + N × (1 read + 2 writes) = 1 + 3N
+     * Compared to N × push: N × (2 reads + 2 writes + 1 RMW) = 5N
+     * Savings: (5N - 1 - 3N) / 5N = (2N - 1) / 5N ≈ 40% when N is large
+     */
+    int push_batch(PTO2TaskSlotState** tasks, int count) {
+        if (count <= 0) return 0;
+
+        uint64_t pos = enqueue_pos.fetch_add(count, std::memory_order_relaxed);
+
+        for (int i = 0; i < count; i++) {
+            PTO2ReadyQueueSlot* slot = &slots[(pos + i) & mask];
+            while (slot->sequence.load(std::memory_order_acquire) != (int64_t)(pos + i)) {
+                SPIN_WAIT_HINT();
+            }
+            slot->slot_state = tasks[i];
+            slot->sequence.store((int64_t)(pos + i + 1), std::memory_order_release);
+        }
+        return count;
+    }
+
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool push(PTO2TaskSlotState* slot_state, uint64_t& atomic_count, uint64_t& wait_cycle) {
         uint64_t pos;
@@ -416,14 +439,35 @@ struct PTO2SchedulerState {
     }
 #endif
 
+    /**
+     * Check if task becomes ready after fanin release.
+     * Returns pointer to slot_state if ready, nullptr otherwise.
+     * Caller is responsible for pushing to queue.
+     */
+    PTO2TaskSlotState* check_fanin_ready(PTO2TaskSlotState& slot_state) {
+        int32_t pred = slot_state.pred_count.load(std::memory_order_relaxed);
+        bool need_process = (pred == 1) ||
+            (slot_state.pred_count.fetch_sub(1, std::memory_order_relaxed) == 1);
+
+        if (need_process) {
+            PTO2TaskState expected = PTO2_TASK_PENDING;
+            if (slot_state.task_state.compare_exchange_strong(
+                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return &slot_state;
+            }
+        }
+        return nullptr;
+    }
+
     bool release_fanin_and_check_ready(PTO2TaskSlotState& slot_state,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        // Atomically increment fanin_refcount and check if all producers are done
-        // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
-        // init release, making fanin_count visible — plain load suffices.
-        int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // Pypto-style optimization: fast path check before atomic operation
+        // If pred_count == 1, it will become 0 after decrement, no need for atomic
+        int32_t pred = slot_state.pred_count.load(std::memory_order_relaxed);
+        bool need_process = (pred == 1) ||
+            (slot_state.pred_count.fetch_sub(1, std::memory_order_relaxed) == 1);
 
-        if (new_refcount == slot_state.fanin_count) {
+        if (need_process) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
@@ -444,10 +488,14 @@ struct PTO2SchedulerState {
     bool release_fanin_and_check_ready(PTO2TaskSlotState& slot_state,
                                         uint64_t& atomic_count, uint64_t& push_wait,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
-        atomic_count += 1;  // fanin_refcount.fetch_add
+        // Pypto-style optimization: fast path check before atomic operation
+        int32_t pred = slot_state.pred_count.load(std::memory_order_relaxed);
+        atomic_count += 1;  // pred_count.load
+        bool need_process = (pred == 1) ||
+            (slot_state.pred_count.fetch_sub(1, std::memory_order_relaxed) == 1);
+        atomic_count += 1;  // pred_count.fetch_sub (if not fast path)
 
-        if (new_refcount == slot_state.fanin_count) {
+        if (need_process) {
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (slot_state.task_state.compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -579,7 +627,14 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
 #endif
 
-        // Fanout: notify consumers
+        // Pypto-style optimization: batch collect ready tasks, then batch push
+        // Reduces memory access from N × 5 to 1 + 3N for queue operations
+        PTO2TaskSlotState* ready_aic[64];
+        PTO2TaskSlotState* ready_aiv[64];
+        int ready_aic_count = 0;
+        int ready_aiv_count = 0;
+
+        // Fanout: notify consumers and collect ready tasks
 #if PTO2_SCHED_PROFILING
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
@@ -587,14 +642,40 @@ struct PTO2SchedulerState {
             PTO2TaskSlotState& consumer_slot = *current->slot_state;
 #if PTO2_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot,
-                                               fanout_atomics, push_wait, local_bufs)) {
-                stats.tasks_enqueued++;
-            }
-#else
-            release_fanin_and_check_ready(consumer_slot, local_bufs);
 #endif
+            PTO2TaskSlotState* ready_task = check_fanin_ready(consumer_slot);
+            if (ready_task != nullptr) {
+#if PTO2_SCHED_PROFILING
+                stats.tasks_enqueued++;
+#endif
+                // Route by active_mask: AIC-containing tasks → AIC queue, AIV-only → AIV queue
+                int32_t buf_idx = (ready_task->active_mask & 0x01) ? 0 : 1;
+                bool pushed_local = false;
+                if (local_bufs) {
+                    pushed_local = local_bufs[buf_idx].try_push(ready_task);
+                }
+                if (!pushed_local) {
+                    // Collect for batch push
+                    if (buf_idx == 0) {
+                        if (ready_aic_count < 64) {
+                            ready_aic[ready_aic_count++] = ready_task;
+                        }
+                    } else {
+                        if (ready_aiv_count < 64) {
+                            ready_aiv[ready_aiv_count++] = ready_task;
+                        }
+                    }
+                }
+            }
             current = current->next;
+        }
+
+        // Batch push collected tasks
+        if (ready_aic_count > 0) {
+            ready_queues[0].push_batch(ready_aic, ready_aic_count);
+        }
+        if (ready_aiv_count > 0) {
+            ready_queues[1].push_batch(ready_aiv, ready_aiv_count);
         }
 
 #if PTO2_SCHED_PROFILING

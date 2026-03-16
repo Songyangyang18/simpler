@@ -338,8 +338,10 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<PTO2TaskState> task_state;   // PENDING/READY/RUNNING/COMPLETED/CONSUMED
 
     // Fanin (accessed together in release_fanin_and_check_ready)
-    std::atomic<int32_t> fanin_refcount;     // Dynamic: counts completed producers
-    int32_t fanin_count;                      // Number of producer dependencies (set once)
+    // Optimization: Use pred_count (decrement) instead of fanin_refcount (increment)
+    // When pred_count reaches 0, task is ready - avoids comparing with fanin_count
+    std::atomic<int32_t> pred_count;          // Dynamic: decrements to 0 when all producers done
+    int32_t fanin_count;                      // Number of producer dependencies (set once, used to init pred_count)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references

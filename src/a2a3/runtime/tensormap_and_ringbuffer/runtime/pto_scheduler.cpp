@@ -129,14 +129,14 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 
     // Zero-initialize all per-task slot state fields.
     // new[] default-initializes std::atomic<T> which leaves values indeterminate.
-    // Scheduler logic (e.g. fanin_refcount fetch_add in release_fanin_and_check_ready)
+    // Scheduler logic (e.g. pred_count fetch_sub in release_fanin_and_check_ready)
     // assumes slots start at zero before the orchestrator's init release.
     for (uint64_t i = 0; i < sm_handle->header->task_window_size; i++) {
         sched->slot_states[i].fanout_lock.store(0, std::memory_order_relaxed);
         sched->slot_states[i].fanout_count = 0;
         sched->slot_states[i].fanout_head = nullptr;
         sched->slot_states[i].task_state.store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
-        sched->slot_states[i].fanin_refcount.store(0, std::memory_order_relaxed);
+        sched->slot_states[i].pred_count.store(0, std::memory_order_relaxed);
         sched->slot_states[i].fanin_count = 0;
         sched->slot_states[i].fanout_refcount.store(0, std::memory_order_relaxed);
     }

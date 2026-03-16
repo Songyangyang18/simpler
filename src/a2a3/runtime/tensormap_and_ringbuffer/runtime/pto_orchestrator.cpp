@@ -393,7 +393,9 @@ void pto2_submit_mixed_task(
         // Initial fanout_count = 1 (the owning scope holds one reference)
         slot_state.fanout_count = 1;
         slot_state.fanout_refcount.store(0, std::memory_order_release);
-        slot_state.fanin_refcount.store(0, std::memory_order_release);
+        // Optimization: pred_count uses decrement instead of increment
+        // Will be set after dependency analysis
+        slot_state.pred_count.store(0, std::memory_order_release);
         slot_state.payload = payload;
         slot_state.task = &task;
         slot_state.active_mask = active_mask;
@@ -575,11 +577,11 @@ void pto2_submit_mixed_task(
             }
         }
         // Combined release: merge early_finished batch with the +1 init release
-        // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
-        int32_t initial_refcount = early_finished + 1;  // +1 for the init release
-        int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
-                         + initial_refcount;
-        if (new_rc >= fanin_count + 1) {
+        // Optimization: Use pred_count (decrement) instead of fanin_refcount (increment)
+        // pred_count starts at (fanin_count - early_finished), decrements to 0 when ready
+        int32_t remaining_preds = fanin_count - early_finished;
+        cur_slot_state.pred_count.store(remaining_preds, std::memory_order_release);
+        if (remaining_preds == 0) {
             PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
             sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
         }
@@ -587,9 +589,7 @@ void pto2_submit_mixed_task(
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
         // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
         g_orch_fanin_atomic_count += fanin_count * 3;
-        if (early_finished > 0) {
-            g_orch_fanin_atomic_count += 1;  // fanin_refcount.fetch_add
-        }
+        g_orch_fanin_atomic_count += 1;  // pred_count.store
 #endif
     }
 

@@ -1247,24 +1247,24 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 for (int32_t si = 0; si < task_count; si++) {
                     PTO2TaskSlotState& slot_state = sched->get_slot_state_by_task_id(si);
                     PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-                    int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
+                    int32_t pc = slot_state.pred_count.load(std::memory_order_relaxed);
                     int32_t fi = slot_state.fanin_count;
                     int32_t kid = slot_state.task->kernel_id[0];
                     if (st >= PTO2_TASK_COMPLETED) continue; // Already done
                     if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) { cnt_inflight++; continue; }
                     // PENDING
-                    if (rc >= fi) {
+                    if (pc == 0) {
                         // Ready (all deps satisfied) but not enqueued — this is the real bug
                         cnt_ready++;
                         if (cnt_ready <= STALL_DUMP_READY_MAX) {
-                            DEV_ALWAYS("  STUCK-READY  task_id=%d kernel_id=%d refcount=%d fanin=%d state=%d",
-                                       slot_state.task->mixed_task_id, kid, rc, fi, (int32_t)st);
+                            DEV_ALWAYS("  STUCK-READY  task_id=%d kernel_id=%d pred_count=%d fanin=%d state=%d",
+                                       slot_state.task->mixed_task_id, kid, pc, fi, (int32_t)st);
                         }
                     } else {
                         cnt_waiting++;
                         if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
-                            DEV_ALWAYS("  STUCK-WAIT   task_id=%d kernel_id=%d refcount=%d fanin=%d state=%d",
-                                       slot_state.task->mixed_task_id, kid, rc, fi, (int32_t)st);
+                            DEV_ALWAYS("  STUCK-WAIT   task_id=%d kernel_id=%d pred_count=%d fanin=%d state=%d",
+                                       slot_state.task->mixed_task_id, kid, pc, fi, (int32_t)st);
                         }
                     }
                 }
