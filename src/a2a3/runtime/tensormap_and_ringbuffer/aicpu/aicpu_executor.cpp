@@ -984,13 +984,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     // Local-first dispatch buffers (stack-allocated, one per CoreType per scheduling thread).
     // Initialized once; must be empty at the start of each iteration.
-    constexpr int LOCAL_READY_CAP_PER_TYPE = 256;
+    // Use PTO2_LOCAL_READY_CAP_DEFAULT (512) for better local-first dispatch hit rate
+    constexpr int LOCAL_READY_CAP_PER_TYPE = PTO2_LOCAL_READY_CAP_DEFAULT;
     PTO2TaskSlotState* local_aic_ptrs[LOCAL_READY_CAP_PER_TYPE];
     PTO2TaskSlotState* local_aiv_ptrs[LOCAL_READY_CAP_PER_TYPE];
     PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ptrs, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ptrs, LOCAL_READY_CAP_PER_TYPE);
-    PTO2TaskSlotState* deferred_release_slot_states[256];
+    PTO2TaskSlotState* deferred_release_slot_states[PTO2_LOCAL_READY_CAP_DEFAULT];
     int32_t deferred_release_count = 0;
 
     bool cores_released = false;
@@ -1112,6 +1113,20 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             }
         }
 #endif
+
+        // Phase 1.5: Overflow handling - push excess tasks to global queue for load balancing
+        // When local buffer exceeds threshold, move excess to global queue so other threads can steal
+        for (int bi = 0; bi < PTO2_LOCAL_DISPATCH_TYPE_NUM; bi++) {
+            if (local_bufs[bi].should_overflow()) {
+                int excess = local_bufs[bi].overflow_count();
+                for (int i = 0; i < excess && local_bufs[bi].count > PTO2_LOCAL_READY_OVERFLOW_THRESHOLD; i++) {
+                    PTO2TaskSlotState* slot_state = local_bufs[bi].pop();
+                    if (slot_state) {
+                        rt->scheduler.requeue_ready_task(*slot_state);
+                    }
+                }
+            }
+        }
 
         // Phase 2: Local dispatch — drain local_bufs, match to idle clusters (zero MPMC operations)
         // Phase 3: Global queue — push overflow to readyQ + fill remaining idle cores from readyQ
