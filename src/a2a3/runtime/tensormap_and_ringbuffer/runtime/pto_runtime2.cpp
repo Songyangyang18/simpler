@@ -27,9 +27,9 @@ void pto2_set_orch_thread_idx(int idx) {
 // =============================================================================
 
 static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                             PTOParam* params, int32_t num_params) {
+                             const PTOParam& params) {
     pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                           params, num_params);
+                           params);
 }
 
 void pto2_rt_scope_begin(PTO2Runtime* rt) {
@@ -44,11 +44,16 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]);
 }
 
+static bool is_fatal_impl(PTO2Runtime* rt) {
+    return rt->orchestrators[pto2_current_orch_idx].fatal;
+}
+
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task          = submit_task_impl,
     .scope_begin          = pto2_rt_scope_begin,
     .scope_end            = pto2_rt_scope_end,
     .orchestration_done   = pto2_rt_orchestration_done,
+    .is_fatal             = is_fatal_impl,
     .log_error            = unified_log_error,
     .log_warn             = unified_log_warn,
     .log_info             = unified_log_info,

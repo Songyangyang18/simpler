@@ -27,11 +27,12 @@
 #define PTO_RING_BUFFER_H
 
 #include <inttypes.h>
-#include <stdlib.h>  // for exit()
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
+
+struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
 
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
@@ -67,6 +68,9 @@ struct PTO2HeapRing {
     // Reference to shared memory tail (for back-pressure)
     std::atomic<uint64_t>* tail_ptr;  // Points to header->heap_tail
 
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
     /**
      * Allocate memory from heap ring
      *
@@ -75,7 +79,7 @@ struct PTO2HeapRing {
      * Never splits a buffer across the wrap-around boundary.
      *
      * @param size  Requested size in bytes
-     * @return Pointer to allocated memory, never NULL (stalls instead)
+     * @return Pointer to allocated memory, or nullptr on fatal error
      */
     void* pto2_heap_ring_alloc(uint64_t size) {
         // Align size for DMA efficiency
@@ -160,7 +164,10 @@ struct PTO2HeapRing {
                 LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %lu)",
                           (unsigned long)(this->size * 2));
                 LOG_ERROR("========================================");
-                exit(1);
+                if (error_code_ptr) {
+                    error_code_ptr->store(PTO2_ERROR_HEAP_RING_DEADLOCK, std::memory_order_release);
+                }
+                return nullptr;
             }
 
             SPIN_WAIT_HINT();
@@ -264,6 +271,9 @@ struct PTO2TaskRing {
     // Reference to shared memory last_task_alive (for back-pressure)
     std::atomic<int32_t>* last_alive_ptr;  // Points to header->last_task_alive
 
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
     /**
      * Allocate a task slot from task ring
      *
@@ -361,7 +371,10 @@ struct PTO2TaskRing {
                 LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
                 LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_count * 2);
                 LOG_ERROR("========================================");
-                exit(1);
+                if (error_code_ptr) {
+                    error_code_ptr->store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
+                }
+                return -1;
             }
 
             SPIN_WAIT_HINT();
@@ -457,13 +470,27 @@ struct PTO2DepListPool {
     int32_t top;              // Linear next-allocation counter (starts from 1)
     int32_t tail;             // Linear first-alive counter (entries before this are dead)
     int32_t high_water;       // Peak concurrent usage (top - tail)
+    int32_t last_reclaimed{0}; // last_task_alive at last successful reclamation
+
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
+    /**
+     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
+     * Safe to call multiple times — only advances tail forward.
+     *
+     * @param sched              Scheduler state (for reading slot dep_pool_mark)
+     * @param ring_id            Ring layer index
+     * @param sm_last_task_alive Current last_task_alive from shared memory
+     */
+    void reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_t sm_last_task_alive);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
      *
-     * @return Reference to allocated entry
+     * @return Pointer to allocated entry, or nullptr on fatal error
      */
-    PTO2DepListEntry& alloc() {
+    PTO2DepListEntry* alloc() {
         int32_t used = top - tail;
         if (used >= capacity) {
             LOG_ERROR("========================================");
@@ -478,13 +505,16 @@ struct PTO2DepListPool {
             LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
             LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
             LOG_ERROR("========================================");
-            exit(1);
+            if (error_code_ptr) {
+                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
+            }
+            return nullptr;
         }
         int32_t idx = top % capacity;
         top++;
         used++;
         if (used > high_water) high_water = used;
-        return base[idx];
+        return &base[idx];
     }
 
     /**
@@ -507,10 +537,11 @@ struct PTO2DepListPool {
      * @return New head offset
      */
     PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
-        PTO2DepListEntry& new_entry = alloc();
-        new_entry.slot_state = slot_state;
-        new_entry.next = cur;
-        return &new_entry;
+        PTO2DepListEntry* new_entry = alloc();
+        if (!new_entry) return nullptr;
+        new_entry->slot_state = slot_state;
+        new_entry->next = cur;
+        return new_entry;
     }
 
     /**

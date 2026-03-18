@@ -21,7 +21,6 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
-#include "pto2_dispatch_payload.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -56,6 +55,21 @@
 #endif
 
 // =============================================================================
+// AICPU Error Codes (written to shared memory for Host-side diagnosis)
+// =============================================================================
+
+// Orchestrator errors (1-99): detected in orchestrator thread
+#define PTO2_ERROR_NONE                       0
+#define PTO2_ERROR_SCOPE_DEADLOCK             1
+#define PTO2_ERROR_HEAP_RING_DEADLOCK         2
+#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
+#define PTO2_ERROR_DEP_POOL_OVERFLOW          4
+#define PTO2_ERROR_INVALID_PARAM              5   // PTOParam construction error (invalid params)
+
+// Scheduler errors (100+): detected in scheduler threads
+#define PTO2_ERROR_SCHEDULER_TIMEOUT          100
+
+// =============================================================================
 // Configuration Constants
 // =============================================================================
 
@@ -75,12 +89,6 @@
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
-// Task parameters
-#define PTO2_MAX_PARAMS           128     // Maximum parameters per task (tensors + scalars)
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
-
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
@@ -95,6 +103,7 @@
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
+#define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 
 // =============================================================================
 // Multi-Ring task_id Encoding
@@ -348,18 +357,36 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
- * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
+ * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
+ * followed by bulk tensor and scalar data. This gives sequential write access
+ * during orchestration and groups scheduler-hot fields (fanin_actual_count +
+ * fanin_slot_states) together for on_task_release.
  */
 struct PTO2TaskPayload {
-    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
-    Tensor tensors[PTO2_MAX_PARAMS];
-    uint64_t scalar_value[PTO2_MAX_PARAMS];
-    bool is_tensor[PTO2_MAX_PARAMS];
-    int param_count{0};
-    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
+    // === Cache line 0 (64B) — metadata ===
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
-    int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+    int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    // === Cache lines 35-50 (1024B) — scalars ===
+    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+
+    void init(const PTOParam& params) {
+        tensor_count = params.tensor_count;
+        scalar_count = params.scalar_count;
+        auto src_tensors = params.tensors;
+        for (int32_t i = 0; i < params.tensor_count; i++) {
+            tensors[i].copy(*src_tensors[i]);
+        }
+        static_assert(sizeof(scalars) == sizeof(params.scalars));
+        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Eliminates branches; extra bytes within the same CL have zero additional cost.
+        memcpy(scalars, params.scalars,
+               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+    }
 };
 
 /**
@@ -399,6 +426,7 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
+    int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

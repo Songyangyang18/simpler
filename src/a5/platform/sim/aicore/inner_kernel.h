@@ -42,10 +42,11 @@
 // scheduler give time slices to threads doing real work (e.g., kernel execution),
 // preventing starvation-induced timeouts on resource-constrained CI runners.
 #include <sched.h>
-#if defined(__x86_64__)
-#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
-#elif defined(__aarch64__)
+
+#if defined(__aarch64__)
 #define SPIN_WAIT_HINT() do { __asm__ volatile("yield" ::: "memory"); sched_yield(); } while(0)
+#elif defined(__x86_64__)
+#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
 #else
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
@@ -61,6 +62,11 @@
 #else
 #define STORE_RELEASE_FENCE() std::atomic_thread_fence(std::memory_order_release)
 #endif
+
+// FULL_MEMORY_BARRIER - full memory barrier preventing all load/store reordering.
+// Used after kernel execution to ensure all writes are visible before signalling
+// completion. Equivalent to dmb ish (aarch64) / mfence (x86).
+#define FULL_MEMORY_BARRIER() __sync_synchronize()
 
 // =============================================================================
 // System Counter Simulation
@@ -118,7 +124,7 @@ inline uint64_t read_reg(RegId reg) {
     volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
         sparse_reg_ptr(g_sim_reg_base, offset));
 
-    __sync_synchronize();
+    FULL_MEMORY_BARRIER();
     return static_cast<uint64_t>(*ptr);
 }
 
@@ -136,7 +142,7 @@ inline void write_reg(RegId reg, uint64_t value) {
         sparse_reg_ptr(g_sim_reg_base, offset));
 
     *ptr = static_cast<uint32_t>(value);
-    __sync_synchronize();
+    FULL_MEMORY_BARRIER();
 }
 
 /**
