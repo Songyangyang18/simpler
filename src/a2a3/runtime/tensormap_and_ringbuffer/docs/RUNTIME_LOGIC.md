@@ -325,10 +325,9 @@ When `pto2_submit_task` processes parameters:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
-| `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
-| `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
-| `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
+| `task_id` | Canonical task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
+| `kernel_id` | Single kernel ID for this task (not an array) |
+| `core_type` | Core type for dispatch: `AIC` or `AIV` |
 | `fanin_count` | Number of producer dependencies |
 | `fanout_lock` | Per-task spinlock for concurrent fanout modification |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
@@ -446,11 +445,13 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 1 — Completion Handling**:
 - Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(mixed_task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(mixed_task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
+- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
 **Phase 2 — Dispatch**:
-- For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
-- Build `PTO2DispatchPayload` from `TaskDescriptor` with `mixed_task_id`, `subslot`, `kernel_id`, and `core_type`
+- Count idle cores per CoreType (AIC/AIV)
+- Batch collect ready tasks from unified ready queue (lock-free MPMC Vyukov queue)
+- Dispatch tasks to idle cores matching their `core_type`
+- Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
@@ -459,9 +460,9 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `pto2_active_mask_to_shape(task->active_mask)`
-- **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
+- **Single unified `PTO2ReadyQueue`**: all ready tasks in one queue (simplified from previous shape-based queues)
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the unified queue
+- **Pop**: scheduler threads pop tasks and dispatch based on each task's `core_type`
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
 
@@ -498,7 +499,7 @@ Each AICore worker has a `Handshake` struct in shared memory:
 
 Instead of polling `Handshake.task_status`, the production protocol uses hardware registers.
 
-> **Multi-ring note**: `mixed_task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `mixed_task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
+> **Multi-ring note**: `task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
 
 | Register | Direction | Usage |
 |----------|-----------|-------|
@@ -518,13 +519,10 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Mixed-task identifier (for completion aggregation) |
-| `subslot` | Which subtask slot this dispatch represents (`AIC`, `AIV0`, or `AIV1`) |
-| `kernel_id` | Function ID for this subtask slot |
-| `core_type` | AIC or AIV |
 | `function_bin_addr` | GM address of compiled kernel binary |
-| `num_args` | Number of arguments |
 | `args[]` | Tensor addresses and scalar values |
+
+Note: `task_id`, `kernel_id`, and `core_type` are stored in `PTO2TaskDescriptor`, not duplicated in payload.
 
 ---
 
@@ -590,17 +588,14 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 | `make_inout_param(tensor)` | INOUT parameter — read then written |
 | `make_scalar_param(value)` | 64-bit scalar parameter |
 
-### 11.3 Resource Shapes
+### 11.3 Core Types
 
-Tasks are queued by resource shape, which is derived from the `active_mask` in the `MixedKernels` struct:
+Tasks are dispatched based on their `core_type`:
 
-| Shape | Active Mask | Description |
-|-------|-------------|-------------|
-| `AIC_ONLY` | AIC only | AIC cores (matrix multiplication) |
-| `AIV_X1` | AIV0 or AIV1 only | Single AIV core (vector operations) |
-| `AIV_X2` | AIV0 + AIV1 | Two AIV cores |
-| `AIC_AIV_X1` | AIC + one AIV | AIC + single AIV core |
-| `AIC_AIV_X2` | AIC + AIV0 + AIV1 | Full cluster (AIC + two AIV cores) |
+| Core Type | Description |
+|-----------|-------------|
+| `AIC` | AIC cores (matrix multiplication) |
+| `AIV` | AIV cores (vector operations) |
 
 ### 11.4 Orchestration Export Interface
 

@@ -305,8 +305,16 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-void pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
+/**
+ * Submit a single task with kernel and core type.
+ *
+ * SIMPLIFIED: No more mixed tasks. Each task executes one kernel.
+ */
+void pto2_submit_task(
+    PTO2OrchestratorState* orch,
+    int32_t kernel_id,
+    CoreType core_type,
+    const PTOParam& params) {
     // Fast path after fatal error — all subsequent submits are no-ops
     if (orch->fatal) {
         return;
@@ -332,20 +340,8 @@ void pto2_submit_mixed_task(
     CYCLE_COUNT_START();
 
     // === Validate submit inputs ===
-    uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
-    always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
-
-    // Normalize single-AIV tasks: if only aiv1 is set, move it to the aiv0 slot.
-    // This guarantees the dispatch path can always use PTO2SubtaskSlot::AIV0 for
-    // AIV_X1 and AIC_AIV_X1 shapes without inspecting active_mask.
-    MixedKernels normalized = mixed_kernels;
-    bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
-    bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
-    if (has_aiv1 && !has_aiv0) {
-        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
-        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = pto2_mixed_kernels_to_active_mask(normalized);
-    }
+    always_assert(kernel_id != INVALID_KERNEL_ID && "kernel_id must be valid");
+    always_assert(core_type == CoreType::AIC || core_type == CoreType::AIV);
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
 
@@ -411,7 +407,7 @@ void pto2_submit_mixed_task(
     int32_t local_id = task_ring.pto2_task_ring_alloc();
     if (local_id < 0) { orch->fatal = true; return; }
     int32_t slot = task_ring.get_task_slot(local_id);
-    PTO2TaskId mixed_task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
+    PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
@@ -444,8 +440,7 @@ void pto2_submit_mixed_task(
         slot_state.fanin_refcount.store(0, std::memory_order_release);
         slot_state.payload = payload;
         slot_state.task = &task;
-        slot_state.active_mask = active_mask;
-        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
+        slot_state.core_type = core_type;
         slot_state.ring_id = ring_id;
         scope_tasks_push(orch, &slot_state);
     } else {
@@ -550,7 +545,7 @@ void pto2_submit_mixed_task(
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+                orch->tensor_map.insert(*params.tensors[i], task_id, ptype == PTOParamType::OUTPUT);
             }
         }
     }
@@ -561,10 +556,9 @@ void pto2_submit_mixed_task(
     // Deferred from allocation phase to avoid scattered GM writes that get
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
-    task.mixed_task_id = mixed_task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
+    task.task_id = task_id;
+    task.kernel_id = kernel_id;
+    task.core_type = core_type;
     task.packed_buffer_base = local_packed_base;
     task.packed_buffer_end = local_packed_end;
 
@@ -591,7 +585,7 @@ void pto2_submit_mixed_task(
         auto& rs = sched->ring_sched_states[ring_id];
         PTO2TaskSlotState& cur_slot_state = rs.get_slot_state_by_slot(slot);
         // Initialize scheduler state BEFORE adding to producer fanout lists,
-        // so concurrent on_mixed_task_complete can safely access task_state/fanout_refcount.
+        // so concurrent on_task_complete can safely access task_state/fanout_refcount.
         cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
 
@@ -619,13 +613,14 @@ void pto2_submit_mixed_task(
             pto2_fanout_lock(producer_slot_state);
 #endif
             // Normal path: prepend consumer to producer's fanout list
-            producer_slot_state.fanout_count += 1;
             int32_t prod_state = producer_slot_state.task_state.load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
                 // Early return optimization: if producer already completed, we can skip adding dependency and directly
-                // decrement fanin_count
+                // decrement fanin_count. Do NOT increment fanout_count since no link is established.
                 early_finished++;
             } else {
+                // Only increment fanout_count and add to fanout list if producer hasn't completed yet
+                producer_slot_state.fanout_count += 1;
                 producer_slot_state.fanout_head = orch->dep_pool_cur_entries[ring_id];
             }
             pto2_fanout_unlock(producer_slot_state);
@@ -639,8 +634,14 @@ void pto2_submit_mixed_task(
         int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
                          + initial_refcount;
         if (new_rc >= fanin_count + 1) {
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
-            sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
+            // CAS: PENDING -> READY before pushing to queue
+            PTO2TaskState expected = PTO2_TASK_PENDING;
+            if (cur_slot_state.task_state.compare_exchange_strong(
+                    expected, PTO2_TASK_READY,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Push to unified ready queue
+                sched->ready_queue.push(&cur_slot_state);
+            }
         }
         // Record dep pool watermark in local slot state (used by tail reclamation)
         cur_slot_state.dep_pool_mark = orch->rings[ring_id].dep_pool.top;

@@ -336,14 +336,15 @@ struct PTO2DepListEntry {
  * Contains static identification and buffer pointers only.
  * Dynamic scheduling state (fanin/fanout/task_state) is in PTO2TaskSlotState.
  *
- * Fields set by Orchestrator at submission, read by Scheduler for dispatch.
+ * SIMPLIFIED: Each task executes one kernel on one core type (AIC or AIV).
  */
 struct PTO2TaskDescriptor {
-    // Mixed-task identification (encodes ring_id in upper 32 bits)
-    PTO2TaskId mixed_task_id;         // raw: (ring_id << 32) | local_id
+    // Task identification (encodes ring_id in upper 32 bits)
+    PTO2TaskId task_id;         // raw: (ring_id << 32) | local_id
 
-    // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
-    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
+    // Kernel and core type for this task
+    int32_t kernel_id;          // Single kernel ID (not an array)
+    CoreType core_type;         // AIC or AIV
 
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
@@ -396,6 +397,8 @@ struct PTO2TaskPayload {
  * structure (32 bytes = half a cache line). Accessing any field of a task's
  * slot state brings all related fields into the same cache line.
  *
+ * SIMPLIFIED: No more mixed-task completion tracking.
+ *
  * Concurrency notes:
  * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
  * - fanin_count set once at submission, read-only after (hot path for ready check)
@@ -422,11 +425,11 @@ struct alignas(64) PTO2TaskSlotState {
 
     PTO2TaskDescriptor* task;
 
-    // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
-    uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
-    std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
-    uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
-    int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
+    // Core type for this task (AIC or AIV)
+    CoreType core_type;                      // Set once at submission
+
+    uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
+    int32_t dep_pool_mark{0};                // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

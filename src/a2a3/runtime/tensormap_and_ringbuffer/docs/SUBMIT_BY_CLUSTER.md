@@ -43,94 +43,74 @@ Design must preserve the current main runtime architecture:
 ## 5. Terminology
 
 1. `cluster`: one physical unit with `1 AIC + 2 AIV`.
-2. `MixedKernels`: 3 submit slots (`AIC`, `AIV0`, `AIV1`) with `INVALID_KERNEL_ID` for inactive slots.
-3. `MixedTask`: one runtime graph node created by one submit call.
-4. `active_mask`: bitmask of active subtask slots.
-5. `resource shape`: normalized lane demand class of a mixed task.
+2. `Task`: one runtime graph node created by one submit call (simplified from MixedTask).
+3. `kernel_id`: single kernel identifier for this task.
+4. `core_type`: target core type (AIC or AIV) for this task.
 
 ## 6. API Contract
 
 ```cpp
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
 
-struct MixedKernels {
-    int32_t aic_kernel_id{INVALID_KERNEL_ID};
-    int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
-    int32_t aiv1_kernel_id{INVALID_KERNEL_ID};
-};
-
+// Submit task to specific core type
 static inline void pto2_rt_submit_task(PTO2Runtime* rt,
-                                       const MixedKernels& mixed_kernels,
-                                       PTOParam* params,
-                                       int32_t num_params);
+                                       int32_t kernel_id,
+                                       CoreType core_type,
+                                       const PTOParam& params);
 
+// Convenience wrappers
 static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt,
                                            int32_t kernel_id,
-                                           PTOParam* params,
-                                           int32_t num_params);
+                                           const PTOParam& params);
 
 static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt,
                                            int32_t kernel_id,
-                                           PTOParam* params,
-                                           int32_t num_params);
+                                           const PTOParam& params);
 ```
 
 Rules:
 
-1. One submit call creates one `MixedTask`.
-2. All active slots share the same `params` and `num_params`.
-3. At least one slot must be active.
-4. `aiv0_kernel_id` and `aiv1_kernel_id` are semantically equivalent.
-5. Wrappers are orchestration sugar only (inline in orchestration API); no dedicated runtime ops entries.
-6. Submit-contract types are defined once in a shared header-only submit-types surface consumed by orchestration and runtime headers.
-7. Invalid submits follow existing PTO2 behavior (`always_assert`), not a new recoverable return-code API.
+1. One submit call creates one `Task` with a single `kernel_id`.
+2. Each task targets exactly one core type (AIC or AIV).
+3. Wrappers are orchestration sugar only (inline in orchestration API); no dedicated runtime ops entries.
+4. Submit-contract types are defined once in a shared header-only submit-types surface consumed by orchestration and runtime headers.
+5. Invalid submits follow existing PTO2 behavior (`always_assert`), not a new recoverable return-code API.
 
 ## 7. Data Model (Requirements + Design)
 
-`PTO2TaskDescriptor` (hot path) carries mixed-task identity/state:
+`PTO2TaskDescriptor` (hot path) carries task identity/state:
 
-1. `mixed_task_id`
-2. `active_mask`
-3. `subtask_done_mask`
-4. `kernel_id[3]` for `(AIC, AIV0, AIV1)`
-5. dependency heads/counters and packed-buffer metadata
+1. `task_id` (single task ID)
+2. `kernel_id` (single kernel ID, not array)
+3. `core_type` (AIC or AIV)
+4. dependency heads/counters and packed-buffer metadata
 
 `PTO2TaskPayload` (cold path) carries:
 
-1. shared params/tensors/scalars copied once per mixed submit
-2. fanin mixed-task IDs
+1. shared params/tensors/scalars copied once per submit
+2. fanin task IDs
 3. other cold-path submit metadata
 
-Producer identity in TensorMap is mixed-task ID end-to-end.
+Producer identity in TensorMap is task ID end-to-end.
 
 ## 8. Scheduling Model
 
-### 8.1 Resource Shapes
+### 8.1 Ready Queue
 
-Runtime uses shape-based ready queues (not worker-type queues):
+Runtime uses a **single unified ready queue** (simplified from previous shape-based queues):
 
-1. `AIC_ONLY`
-2. `AIV_X1`
-3. `AIV_X2`
-4. `AIC_AIV_X1`
-5. `AIC_AIV_X2`
+### 8.2 Independent Core Dispatch
 
-Queueing key is normalized resource shape (not raw slot label).
-
-### 8.2 Atomic Cluster Dispatch
-
-1. Dispatch decision unit is one mixed task.
-2. For multi-slot mixed tasks, partial launch is forbidden.
-3. A mixed task is dispatchable only when one local owned cluster can satisfy all required lanes.
-4. Compatible mixed tasks may co-reside over time if they use disjoint free lanes.
+1. Each task dispatches to a single core based on its `core_type`.
+2. Batch scheduling: collect all ready tasks, dispatch by core type availability.
+3. Local Buffer optimization: thread-local task buffer for local-first dispatch.
+4. Overflow to global unified Ready Queue when local buffer is full.
 
 ### 8.3 Dependency and Completion
 
 1. Fanin release/readiness remains dependency-correct and graph-level.
-2. Two-stage completion:
-   - `on_subtask_complete(mixed_task_id, subslot)`
-   - `on_mixed_task_complete(mixed_task_id)` only when `subtask_done_mask == active_mask`
-3. Downstream release is triggered once per mixed task completion, not once per subslot.
+2. Single-stage completion: `on_task_complete(task_id)` handles fanout notification, fanin release, and self-consumption check in one pass.
+3. Downstream release is triggered once per task completion.
 
 ## 9. Executor Ownership and Numbering
 
@@ -154,21 +134,19 @@ This project-defined flattened numbering is kept unchanged.
 
 ## 10. Functional Requirements
 
-### 10.1 Valid Mixed Shapes
+### 10.1 Valid Task Types
 
-1. AIC only
-2. AIV only (1 or 2 AIV lanes)
-3. AIC + 1 AIV
-4. AIC + 2 AIV
+1. AIC task: `core_type = CoreType::AIC`
+2. AIV task: `core_type = CoreType::AIV`
 
 ### 10.2 Runtime Behavior per Submit
 
 1. Validate submit arguments.
-2. Allocate mixed-task ID and initialize descriptor/payload once.
-3. Build fanin/fanout at mixed-task granularity.
-4. Enqueue by shape when ready.
-5. Dispatch all active lanes atomically when resources allow.
-6. Aggregate completion and release downstream once.
+2. Allocate task ID and initialize descriptor/payload once.
+3. Build fanin/fanout at task granularity.
+4. Enqueue to unified ready queue when ready.
+5. Dispatch to available core matching core_type.
+6. Single-stage completion triggers downstream release once.
 
 ## 11. Non-Functional Requirements
 
@@ -194,9 +172,9 @@ Feature is accepted when:
 Recommended validation coverage:
 
 1. Mapping correctness for cluster-to-core ID relation.
-2. Atomic dispatch for multi-slot shapes.
-3. Dependency gating and completion aggregation (`done_mask == active_mask`).
-4. Lane-occupancy co-residency behavior for compatible shapes.
+2. Dispatch to correct core type (AIC/AIV).
+3. Dependency gating and single-stage completion.
+4. Unified ready queue behavior.
 5. Multi-orchestrator and core-transition ownership stability.
 6. Invalid submit handling (`always_assert` path).
 7. Regression coverage for existing examples/tests.

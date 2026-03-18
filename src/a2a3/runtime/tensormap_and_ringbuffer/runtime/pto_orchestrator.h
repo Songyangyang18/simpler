@@ -167,7 +167,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
 // =============================================================================
 
 /**
- * Submit a task with InCore function and parameters
+ * Submit a single task with kernel and core type.
  *
  * This is the main API for building the task graph:
  * 1. Allocates task slot from TaskRing (blocks until available)
@@ -178,11 +178,13 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * 6. Initializes task state in scheduler
  *
  * @param orch        Orchestrator state
- * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
+ * @param kernel_id   Kernel ID for this task
+ * @param core_type   Core type (AIC or AIV) for this task
  * @param params      Aggregated tensor and scalar parameters
  */
-void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
-    const MixedKernels& mixed_kernels,
+void pto2_submit_task(PTO2OrchestratorState* orch,
+    int32_t kernel_id,
+    CoreType core_type,
     const PTOParam& params);
 
 // =============================================================================

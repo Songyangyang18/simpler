@@ -42,7 +42,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+    void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id, CoreType core_type,
                         const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -72,9 +72,13 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline void pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                        const PTOParam& params) {
-    rt->ops->submit_task(rt, mixed_kernels, params);
+/**
+ * Submit a task with kernel and core type.
+ * SIMPLIFIED: Each task executes one kernel on one core type.
+ */
+static inline void pto2_rt_submit_task(PTO2Runtime* rt, int32_t kernel_id,
+                                        CoreType core_type, const PTOParam& params) {
+    rt->ops->submit_task(rt, kernel_id, core_type, params);
 }
 
 /**
@@ -82,19 +86,15 @@ static inline void pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixe
  */
 static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
                                             const PTOParam& params) {
-    MixedKernels mk;
-    mk.aic_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params);
+    rt->ops->submit_task(rt, kernel_id, CoreType::AIC, params);
 }
 
 /**
- * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
+ * Convenience wrapper: submit an AIV-only task.
  */
 static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
                                             const PTOParam& params) {
-    MixedKernels mk;
-    mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params);
+    rt->ops->submit_task(rt, kernel_id, CoreType::AIV, params);
 }
 
 static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
